@@ -1,7 +1,8 @@
 import { and, desc, eq } from 'drizzle-orm';
-import type { Db } from '../../../db/client.js';
+import type { Db, DbConn } from '../../../db/client.js';
 import * as t from '../../../db/schema.js';
-import type { RunSummary, RunTrace } from '@devdigest/shared';
+import { RunTrace } from '@devdigest/shared';
+import type { RunSummary } from '@devdigest/shared';
 
 // ---- in-flight / history --------------------------------------------------
 
@@ -80,22 +81,56 @@ export async function deleteAgentRun(
   workspaceId: string,
   runId: string,
 ): Promise<boolean> {
-  await db
-    .delete(t.reviews)
-    .where(and(eq(t.reviews.runId, runId), eq(t.reviews.workspaceId, workspaceId)));
+  // ONE transaction: without it a failure between the two DELETEs commits the
+  // review removal while the run row survives — an orphaned timeline entry.
+  // NOTE on ownership: the application layer (use cases + unit-of-work ports)
+  // does not exist yet in this module, so the persistence adapter owns
+  // `db.transaction` directly; a `ReviewUnitOfWork` port takes this over when
+  // the module migrates to the onion layout.
+  return db.transaction(async (tx) => {
+    await tx
+      .delete(t.reviews)
+      .where(and(eq(t.reviews.runId, runId), eq(t.reviews.workspaceId, workspaceId)));
+    const rows = await tx
+      .delete(t.agentRuns)
+      .where(and(eq(t.agentRuns.id, runId), eq(t.agentRuns.workspaceId, workspaceId)))
+      .returning({ id: t.agentRuns.id });
+    return rows.length > 0;
+  });
+}
+
+/** Does this run exist inside the workspace? The tenancy gate for run-addressed
+ *  routes (SSE, cancel, trace) whose URLs carry only a runId. */
+export async function runInWorkspace(
+  db: Db,
+  workspaceId: string,
+  runId: string,
+): Promise<boolean> {
   const rows = await db
-    .delete(t.agentRuns)
-    .where(and(eq(t.agentRuns.id, runId), eq(t.agentRuns.workspaceId, workspaceId)))
-    .returning({ id: t.agentRuns.id });
+    .select({ id: t.agentRuns.id })
+    .from(t.agentRuns)
+    .where(and(eq(t.agentRuns.id, runId), eq(t.agentRuns.workspaceId, workspaceId)));
   return rows.length > 0;
 }
 
-/** Mark a still-running run as cancelled (no-op if it already finished). */
-export async function cancelRunIfRunning(db: Db, runId: string): Promise<boolean> {
+/** Mark a still-running run as cancelled (no-op if it already finished).
+ *  Workspace-scoped: the predicate itself carries the tenancy, so a prior
+ *  ownership check cannot be raced into a cross-workspace write. */
+export async function cancelRunIfRunning(
+  db: Db,
+  workspaceId: string,
+  runId: string,
+): Promise<boolean> {
   const rows = await db
     .update(t.agentRuns)
     .set({ status: 'cancelled' })
-    .where(and(eq(t.agentRuns.id, runId), eq(t.agentRuns.status, 'running')))
+    .where(
+      and(
+        eq(t.agentRuns.id, runId),
+        eq(t.agentRuns.workspaceId, workspaceId),
+        eq(t.agentRuns.status, 'running'),
+      ),
+    )
     .returning({ id: t.agentRuns.id });
   return rows.length > 0;
 }
@@ -140,7 +175,7 @@ export async function createAgentRun(
 }
 
 export async function completeAgentRun(
-  db: Db,
+  db: DbConn,
   runId: string,
   values: {
     status: 'done' | 'failed' | 'cancelled';
@@ -187,7 +222,23 @@ export async function saveRunTrace(db: Db, runId: string, trace: RunTrace): Prom
     .onConflictDoUpdate({ target: t.runTraces.runId, set: { trace } });
 }
 
-export async function getRunTrace(db: Db, runId: string): Promise<RunTrace | undefined> {
-  const [row] = await db.select().from(t.runTraces).where(eq(t.runTraces.runId, runId));
-  return row ? (row.trace as RunTrace) : undefined;
+export async function getRunTrace(
+  db: Db,
+  workspaceId: string,
+  runId: string,
+): Promise<RunTrace | undefined> {
+  const [row] = await db
+    .select({ trace: t.runTraces.trace })
+    .from(t.runTraces)
+    .innerJoin(t.agentRuns, eq(t.agentRuns.id, t.runTraces.runId))
+    .where(and(eq(t.runTraces.runId, runId), eq(t.agentRuns.workspaceId, workspaceId)));
+  if (!row) return undefined;
+  // Persisted jsonb is a trust boundary: validate on read instead of casting.
+  const parsed = RunTrace.safeParse(row.trace);
+  if (!parsed.success) {
+    throw new Error(
+      `run_traces row for run ${runId} failed RunTrace validation: ${parsed.error.message}`,
+    );
+  }
+  return parsed.data;
 }

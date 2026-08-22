@@ -87,9 +87,14 @@ export class ReviewRepository {
     return runRepo.deleteAgentRun(this.db, workspaceId, runId);
   }
 
-  /** Mark a still-running run as cancelled (no-op if it already finished). */
-  cancelRunIfRunning(runId: string): Promise<boolean> {
-    return runRepo.cancelRunIfRunning(this.db, runId);
+  /** Does this run exist inside the workspace? Tenancy gate for run-addressed routes. */
+  runInWorkspace(workspaceId: string, runId: string): Promise<boolean> {
+    return runRepo.runInWorkspace(this.db, workspaceId, runId);
+  }
+
+  /** Mark a still-running run as cancelled (no-op if it already finished). Workspace-scoped. */
+  cancelRunIfRunning(workspaceId: string, runId: string): Promise<boolean> {
+    return runRepo.cancelRunIfRunning(this.db, workspaceId, runId);
   }
 
   /** On boot: any run still 'running' is orphaned (its process died / restarted),
@@ -117,12 +122,20 @@ export class ReviewRepository {
     return reviewRepo.findingContext(this.db, findingId);
   }
 
-  setFindingAccepted(findingId: string, at: Date | null): Promise<FindingRow | undefined> {
-    return reviewRepo.setFindingAccepted(this.db, findingId, at);
+  setFindingAccepted(
+    workspaceId: string,
+    findingId: string,
+    at: Date | null,
+  ): Promise<FindingRow | undefined> {
+    return reviewRepo.setFindingAccepted(this.db, workspaceId, findingId, at);
   }
 
-  setFindingDismissed(findingId: string, at: Date | null): Promise<FindingRow | undefined> {
-    return reviewRepo.setFindingDismissed(this.db, findingId, at);
+  setFindingDismissed(
+    workspaceId: string,
+    findingId: string,
+    at: Date | null,
+  ): Promise<FindingRow | undefined> {
+    return reviewRepo.setFindingDismissed(this.db, workspaceId, findingId, at);
   }
 
   // ---- intent -------------------------------------------------------------
@@ -175,12 +188,42 @@ export class ReviewRepository {
     return pullRepo.markReviewed(this.db, prId, sha);
   }
 
+  /**
+   * Persist a successful run's outcome ATOMICALLY: review + findings +
+   * mark-reviewed + complete the agent_runs row in ONE transaction, so a crash
+   * mid-way can never leave a review without its run completion (or vice
+   * versa). Preserves `completeAgentRun`'s status='running' guard exactly: a
+   * run cancelled mid-flight keeps its terminal 'cancelled' status while the
+   * review/findings/mark-reviewed writes still land, as they always have.
+   *
+   * NOTE on ownership: the application layer (use cases + unit-of-work ports)
+   * does not exist yet in this module, so the persistence adapter owns
+   * `db.transaction` directly; a `ReviewUnitOfWork` port takes this over when
+   * the module migrates to the onion layout.
+   */
+  finalizeRun(input: {
+    review: Parameters<ReviewRepository['insertReview']>[0];
+    findings: Finding[];
+    /** Head SHA the review ran against (markReviewed on the review's PR). */
+    headSha: string;
+    runId: string;
+    run: Parameters<ReviewRepository['completeAgentRun']>[1];
+  }): Promise<{ review: ReviewRow; findings: FindingRow[] }> {
+    return this.db.transaction(async (tx) => {
+      const review = await reviewRepo.insertReview(tx, input.review);
+      const findings = await reviewRepo.insertFindings(tx, review.id, input.findings);
+      await pullRepo.markReviewed(tx, input.review.prId, input.headSha);
+      await runRepo.completeAgentRun(tx, input.runId, input.run);
+      return { review, findings };
+    });
+  }
+
   /** Persist the WHOLE run log as ONE document. PK = runId → agent_runs. */
   saveRunTrace(runId: string, trace: RunTrace): Promise<void> {
     return runRepo.saveRunTrace(this.db, runId, trace);
   }
 
-  getRunTrace(runId: string): Promise<RunTrace | undefined> {
-    return runRepo.getRunTrace(this.db, runId);
+  getRunTrace(workspaceId: string, runId: string): Promise<RunTrace | undefined> {
+    return runRepo.getRunTrace(this.db, workspaceId, runId);
   }
 }

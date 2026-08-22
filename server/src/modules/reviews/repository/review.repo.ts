@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import type { Db } from '../../../db/client.js';
+import type { Db, DbConn } from '../../../db/client.js';
 import * as t from '../../../db/schema.js';
 import type { Finding } from '@devdigest/shared';
 import type { FindingRow, PullRow } from '../../../db/rows.js';
@@ -9,7 +9,7 @@ export type ReviewRow = typeof t.reviews.$inferSelect;
 // ---- reviews + findings ---------------------------------------------------
 
 export async function insertReview(
-  db: Db,
+  db: DbConn,
   values: {
     workspaceId: string;
     prId: string;
@@ -27,7 +27,7 @@ export async function insertReview(
 }
 
 export async function insertFindings(
-  db: Db,
+  db: DbConn,
   reviewId: string,
   findings: Finding[],
 ): Promise<FindingRow[]> {
@@ -116,28 +116,40 @@ export async function findingContext(
   return { finding, review, pull };
 }
 
+/** `findings` has no workspace column — tenancy rides on the owning review.
+ *  The predicate lives inside the UPDATE itself, so a check-then-act caller
+ *  cannot be raced into a cross-workspace write. */
+function findingInWorkspace(db: Db, workspaceId: string) {
+  return inArray(
+    t.findings.reviewId,
+    db.select({ id: t.reviews.id }).from(t.reviews).where(eq(t.reviews.workspaceId, workspaceId)),
+  );
+}
+
 export async function setFindingAccepted(
   db: Db,
+  workspaceId: string,
   findingId: string,
   at: Date | null,
 ): Promise<FindingRow | undefined> {
   const [row] = await db
     .update(t.findings)
     .set({ acceptedAt: at, dismissedAt: null })
-    .where(eq(t.findings.id, findingId))
+    .where(and(eq(t.findings.id, findingId), findingInWorkspace(db, workspaceId)))
     .returning();
   return row;
 }
 
 export async function setFindingDismissed(
   db: Db,
+  workspaceId: string,
   findingId: string,
   at: Date | null,
 ): Promise<FindingRow | undefined> {
   const [row] = await db
     .update(t.findings)
     .set({ dismissedAt: at, acceptedAt: null })
-    .where(eq(t.findings.id, findingId))
+    .where(and(eq(t.findings.id, findingId), findingInWorkspace(db, workspaceId)))
     .returning();
   return row;
 }

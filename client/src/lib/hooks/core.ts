@@ -150,7 +150,12 @@ export function useRefreshRepo() {
       notify.error(job.data?.error?.split("\n")[0] ?? "Refresh failed");
     } else {
       qc.invalidateQueries({ queryKey: ["repos"] });
-      if (repoId) qc.invalidateQueries({ queryKey: ["pulls", repoId] });
+      if (repoId) {
+        qc.invalidateQueries({ queryKey: ["pulls", repoId] });
+        // The PR detail page reads by (repoId, number) now — refresh it too, or
+        // a repo refresh updates the list while an open detail page stays stale.
+        qc.invalidateQueries({ queryKey: ["pull-by-number", repoId] });
+      }
     }
     setJobId(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -189,6 +194,21 @@ export function usePullDetail(prId: string | number | null | undefined) {
     queryKey: ["pull", prId],
     queryFn: () => api.get<PrDetail>(`/pulls/${prId}`),
     enabled: prId != null,
+  });
+}
+
+/**
+ * Resolve a PR directly by its (repoId, number) route key — one request instead
+ * of fetching the whole pulls list to find the row's uuid. The response body is
+ * IDENTICAL to `GET /pulls/:id` (404 when unknown), so the result also seeds
+ * the id-keyed `["pull", id]` cache: anything that later asks for the detail by
+ * uuid gets an instant cache hit.
+ */
+export function usePullByNumber(repoId: string | null | undefined, number: number | null | undefined) {
+  return useQuery({
+    queryKey: ["pull-by-number", repoId, number],
+    queryFn: () => api.get<PrDetail>(`/repos/${repoId}/pulls/number/${number}`),
+    enabled: !!repoId && number != null && Number.isFinite(number),
   });
 }
 

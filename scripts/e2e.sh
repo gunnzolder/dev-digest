@@ -41,6 +41,10 @@ export DATABASE_URL="postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}/${PG_
 export API_PORT WEB_PORT
 export NEXT_PUBLIC_API_BASE="http://localhost:${API_PORT}"
 export E2E_BASE_URL="http://localhost:${WEB_PORT}"
+# Isolated Next build dir (client/next.config.mjs reads NEXT_DIST_DIR): without
+# it, this stack compiles ITS NEXT_PUBLIC_API_BASE into the shared client/.next
+# and silently poisons a concurrently running dev server on :3000.
+export NEXT_DIST_DIR=".next-e2e"
 
 log()  { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
@@ -77,6 +81,16 @@ cleanup() {
     [ -n "$pids" ] && kill $pids 2>/dev/null || true
   done
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+  # The isolated build dir has this run's NEXT_PUBLIC_API_BASE compiled in; a
+  # later run may use different ports, so don't let a stale compile linger.
+  rm -rf "$ROOT/client/.next-e2e"
+  # Next rewrites next-env.d.ts's routes.d.ts reference to the ACTIVE distDir,
+  # so an e2e run dirties the committed file with ".next-e2e/types". Restore
+  # the default so e2e never leaves a git-visible change behind. perl, not
+  # sed -i: BSD and GNU sed disagree on -i's argument and the GNU failure
+  # would be swallowed silently.
+  perl -pi -e 's|\./\.next-e2e/types/routes\.d\.ts|./.next/types/routes.d.ts|' \
+    "$ROOT/client/next-env.d.ts" 2>/dev/null || true
   exit "$code"
 }
 trap cleanup EXIT INT TERM

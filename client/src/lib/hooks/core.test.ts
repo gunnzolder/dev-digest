@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
-import { useAddRepo } from "./core";
+import { waitFor } from "@testing-library/react";
+import { useAddRepo, usePullByNumber } from "./core";
 
 /** Hands back the QueryClient too so a test can spy on `invalidateQueries` —
     proving WHICH keys a mutation invalidates, not just that the request went out. */
@@ -47,5 +48,56 @@ describe("useAddRepo", () => {
     const keys = invalidatedKeys(spy);
     expect(keys).toContainEqual(["repos"]);
     expect(keys).toContainEqual(["github-tokens"]);
+  });
+});
+
+describe("usePullByNumber", () => {
+  const PR = {
+    id: "pr-uuid-1",
+    number: 42,
+    title: "Add feature",
+    body: "",
+    status: "needs_review",
+    files: [],
+    files_count: 0,
+    commits: [],
+    head_sha: "abc",
+  };
+
+  it("fetches the PR via the by-number route", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(JSON.stringify(PR), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { Wrapper } = makeWrapper();
+    const { result } = renderHook(() => usePullByNumber("repo1", 42), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.data).toBeTruthy());
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/repos/repo1/pulls/number/42");
+    expect(result.current.data!.id).toBe("pr-uuid-1");
+  });
+
+  it("is refreshed alongside the pulls list — a repo refresh invalidates the by-number key", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(PR), { status: 200 })),
+    );
+    const { qc, Wrapper } = makeWrapper();
+    const { result } = renderHook(() => usePullByNumber("repo1", 42), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.data).toBeTruthy());
+    // Partial-key invalidation, exactly what useRefreshRepo issues on job done.
+    qc.invalidateQueries({ queryKey: ["pull-by-number", "repo1"] });
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("stays disabled for a non-numeric PR number", () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { Wrapper } = makeWrapper();
+    const { result } = renderHook(() => usePullByNumber("repo1", Number("abc")), {
+      wrapper: Wrapper,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.current.isLoading).toBe(false);
   });
 });
